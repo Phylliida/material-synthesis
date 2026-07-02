@@ -7,4 +7,5 @@
 //! DESIGN.md §11–§12: pure core, fixed-point/integer arithmetic throughout,
 //! prove structure not pixels.
 
+pub mod hash;
 pub mod slab;

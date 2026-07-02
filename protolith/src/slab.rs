@@ -54,94 +54,89 @@ impl SlabDims {
         x + y * self.nx + z * (self.nx * self.ny)
     }
 
-}
+    /// Slab voxel count as exec, with the 2^30 bound proved.
+    #[verifier::tactus_auto]
+    #[verifier::tactus_tactic("tactus_first | tactus_auto | (intros; try zify at *; try push_cast at *; omega) | (rcases arch_word_bits_valid with h | h <;> simp only [usize_hi, isize_hi, h] at * <;> (intros; try zify at *; try push_cast at *; omega))")]
+    pub fn total(&self) -> (t: usize)
+        requires self.wf(),
+        ensures
+            t == self.spec_total(),
+            t <= 0x4000_0000,
+            t >= 1,
+    {
+        assert(1 <= (self.nx as int) * (self.ny as int)
+            && (self.nx as int) * (self.ny as int) <= 0x10_0000) by {
+            intros
+            casesm* _ ∧ _
+            refine ⟨?_, ?_⟩ <;> nlinarith
+        };
+        assert(1 <= (self.nx as int) * (self.ny as int) * (self.nz as int)
+            && (self.nx as int) * (self.ny as int) * (self.nz as int) <= 0x4000_0000) by {
+            intros
+            casesm* _ ∧ _
+            refine ⟨?_, ?_⟩ <;> nlinarith
+        };
+        (self.nx * self.ny) * self.nz
+    }
 
-/// Slab voxel count as exec, with the 2^30 bound proved.
-/// (Free fn rather than an impl method: file-level Lean `import` lines
-/// currently attach only to free fns' generated files — impl-block exec
-/// fns miss them, so Mathlib tactics come back "unknown". See session
-/// notes; likely a small gap in the import-attachment pass.)
-#[verifier::tactus_auto]
-#[verifier::tactus_tactic("tactus_first | tactus_auto | (intros; try zify at *; try push_cast at *; omega) | (rcases arch_word_bits_valid with h | h <;> simp only [usize_hi, isize_hi, h] at * <;> (intros; try zify at *; try push_cast at *; omega))")]
-pub fn slab_total(dims: &SlabDims) -> (t: usize)
-    requires dims.wf(),
-    ensures
-        t == dims.spec_total(),
-        t <= 0x4000_0000,
-        t >= 1,
-{
-    assert(1 <= (dims.nx as int) * (dims.ny as int)
-        && (dims.nx as int) * (dims.ny as int) <= 0x10_0000) by {
-        intros
-        casesm* _ ∧ _
-        refine ⟨?_, ?_⟩ <;> nlinarith
-    };
-    assert(1 <= (dims.nx as int) * (dims.ny as int) * (dims.nz as int)
-        && (dims.nx as int) * (dims.ny as int) * (dims.nz as int) <= 0x4000_0000) by {
-        intros
-        casesm* _ ∧ _
-        refine ⟨?_, ?_⟩ <;> nlinarith
-    };
-    (dims.nx * dims.ny) * dims.nz
-}
+    /// Linear index of an in-range coordinate triple.
+    #[verifier::tactus_auto]
+    #[verifier::tactus_tactic("tactus_first | tactus_auto | (intros; try zify at *; try push_cast at *; omega) | (rcases arch_word_bits_valid with h | h <;> simp only [usize_hi, isize_hi, h] at * <;> (intros; try zify at *; try push_cast at *; omega))")]
+    pub fn index(&self, x: usize, y: usize, z: usize) -> (i: usize)
+        requires
+            self.wf(),
+            x < self.nx,
+            y < self.ny,
+            z < self.nz,
+        ensures
+            i == self.spec_index(x as int, y as int, z as int),
+            i < self.spec_total(),
+    {
+        assert(1 <= (self.nx as int) * (self.ny as int)
+            && (self.nx as int) * (self.ny as int) <= 0x10_0000) by {
+            intros
+            casesm* _ ∧ _
+            refine ⟨?_, ?_⟩ <;> nlinarith
+        };
+        assert(0 <= (y as int) * (self.nx as int)
+            && (y as int) * (self.nx as int) <= 0x10_0000) by {
+            intros
+            casesm* _ ∧ _
+            refine ⟨?_, ?_⟩ <;> nlinarith
+        };
+        // The in-range crux, subtraction-free (Nat-sub is poison for
+        // linarith): x + y*nx < nx*ny, then (z+1)*(nx*ny) <= nz*(nx*ny)
+        // stated additively, then the sum. nlinarith ring-normalizes the
+        // associativity/commutativity differences between the pieces.
+        assert((x as int) + (y as int) * (self.nx as int)
+            < (self.nx as int) * (self.ny as int)) by {
+            intros
+            casesm* _ ∧ _
+            nlinarith
+        };
+        assert((z as int) * ((self.nx as int) * (self.ny as int))
+                + (self.nx as int) * (self.ny as int)
+            <= (self.nz as int) * ((self.nx as int) * (self.ny as int))) by {
+            intros
+            casesm* _ ∧ _
+            nlinarith
+        };
+        assert(0 <= (z as int) * ((self.nx as int) * (self.ny as int))
+            && (z as int) * ((self.nx as int) * (self.ny as int)) <= 0x4000_0000) by {
+            intros
+            casesm* _ ∧ _
+            refine ⟨?_, ?_⟩ <;> nlinarith
+        };
+        assert((x as int) + (y as int) * (self.nx as int)
+                + (z as int) * ((self.nx as int) * (self.ny as int))
+            < (self.nx as int) * (self.ny as int) * (self.nz as int)) by {
+            intros
+            casesm* _ ∧ _
+            nlinarith
+        };
+        x + y * self.nx + z * (self.nx * self.ny)
+    }
 
-/// Linear index of an in-range coordinate triple. (Free fn, same reason
-/// as `slab_total`.)
-#[verifier::tactus_auto]
-#[verifier::tactus_tactic("tactus_first | tactus_auto | (intros; try zify at *; try push_cast at *; omega) | (rcases arch_word_bits_valid with h | h <;> simp only [usize_hi, isize_hi, h] at * <;> (intros; try zify at *; try push_cast at *; omega))")]
-pub fn slab_index(dims: &SlabDims, x: usize, y: usize, z: usize) -> (i: usize)
-    requires
-        dims.wf(),
-        x < dims.nx,
-        y < dims.ny,
-        z < dims.nz,
-    ensures
-        i == dims.spec_index(x as int, y as int, z as int),
-        i < dims.spec_total(),
-{
-    assert(1 <= (dims.nx as int) * (dims.ny as int)
-        && (dims.nx as int) * (dims.ny as int) <= 0x10_0000) by {
-        intros
-        casesm* _ ∧ _
-        refine ⟨?_, ?_⟩ <;> nlinarith
-    };
-    assert(0 <= (y as int) * (dims.nx as int)
-        && (y as int) * (dims.nx as int) <= 0x10_0000) by {
-        intros
-        casesm* _ ∧ _
-        refine ⟨?_, ?_⟩ <;> nlinarith
-    };
-    // The in-range crux, subtraction-free (Nat-sub is poison for
-    // linarith): x + y*nx < nx*ny, then (z+1)*(nx*ny) <= nz*(nx*ny)
-    // stated additively, then the sum. nlinarith ring-normalizes the
-    // associativity/commutativity differences between the pieces.
-    assert((x as int) + (y as int) * (dims.nx as int)
-        < (dims.nx as int) * (dims.ny as int)) by {
-        intros
-        casesm* _ ∧ _
-        nlinarith
-    };
-    assert((z as int) * ((dims.nx as int) * (dims.ny as int))
-            + (dims.nx as int) * (dims.ny as int)
-        <= (dims.nz as int) * ((dims.nx as int) * (dims.ny as int))) by {
-        intros
-        casesm* _ ∧ _
-        nlinarith
-    };
-    assert(0 <= (z as int) * ((dims.nx as int) * (dims.ny as int))
-        && (z as int) * ((dims.nx as int) * (dims.ny as int)) <= 0x4000_0000) by {
-        intros
-        casesm* _ ∧ _
-        refine ⟨?_, ?_⟩ <;> nlinarith
-    };
-    assert((x as int) + (y as int) * (dims.nx as int)
-            + (z as int) * ((dims.nx as int) * (dims.ny as int))
-        < (dims.nx as int) * (dims.ny as int) * (dims.nz as int)) by {
-        intros
-        casesm* _ ∧ _
-        nlinarith
-    };
-    x + y * dims.nx + z * (dims.nx * dims.ny)
 }
 
 /// Toroidal separation along one wrapped axis: the shorter way around.
@@ -264,7 +259,14 @@ pub fn torus_dist2(
         x2 as int, y2 as int, z2 as int)) by {
         intros
         simp only [slab.spec_torus_dist2]
+        rfl
     };
+    // KNOWN BLOCKED (4 goals, 2026-07-02): the two postconditions and this
+    // expression's cast goals hit a Lean-backend ensures-substitution type
+    // mismatch — dx's ℤ-typed spec value is substituted into ℕ-typed exec
+    // arithmetic ("tmp__5 + dz * dz has type ℤ but is expected to have
+    // type ℕ"). Reported to the tactus owner; everything above this line
+    // verifies.
     (dx * dx + dy * dy + dz * dz) as u32
 }
 
