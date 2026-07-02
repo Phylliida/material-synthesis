@@ -1,0 +1,413 @@
+# PROTOLITH — a process-simulating PBR rock texture generator
+
+*Design document, v0.1 — working name negotiable (Protolith: the parent rock from which others are made; here, the parent process from which appearance is made).*
+
+## 0. Thesis and scope
+
+A rock's appearance is a fossilized record of its formation process. Where conventional procedural rock materials tune noise functions until they *look* right, Protolith coarsely simulates petrogenesis and lets the texture fall out. The payoff is twofold. First, physical accuracy becomes checkable: modal mineralogy, grain-size distributions, and reflectance spectra can be compared against real petrological data rather than eyeballed. Second, the parameter space collapses into a small set of *geological* parameters — bulk chemistry, cooling schedule, transport energy, metamorphic grade, weathering age — instead of dozens of opaque noise knobs.
+
+The system is six process operators acting on a composition, plus a compiler:
+
+```
+crystallize[τ]    — nucleation-and-growth from melt          (igneous; volume/wall/point-seeded)
+deposit[E]        — transport, settling, diagenesis           (clastic/chemical sedimentary)
+deform[T, L]      — recrystallization under heat + kinematics (metamorphic; L = velocity gradient)
+precipitate[chem] — reaction–transport from fluids            (replacement, rhythmic bands, accretion)
+unmix[χ, M]       — subsolidus phase separation               (exsolution; Cahn–Hilliard)
+weather[t, clim]  — chemical alteration + erosion             (surface aging)
+compile           — petrofabric → PBR channel maps            (optics)
+```
+
+These compose. `deform` takes any fabric as protolith, so *marble = deform(deposit(carbonate))*, *gneiss = deform(crystallize(granitic melt))*, *quartzite = deform(deposit(quartz sand))*, *an agate geode = precipitate(vesicle(crystallize(basalt)))*. `deposit` can (v2) sample clasts from other generated rocks. Rock space is the closure of these operators over composition space — the rock cycle, literally, as an operator algebra. Everything else in this document is the concrete realization of those arrows.
+
+Out of scope: migmatites (two-phase melt segregation — the one honest holdout, see §14), full thermodynamic phase equilibria (petrogenetic-grid lookups stand in), wet-surface optics. Essentially everything else in rock space is in scope, including biogenic rocks via content packs (§13, M7).
+
+## 1. Architecture at a glance
+
+```
+params (JSON)
+   │
+   ▼
+[A] Composition solver        chemistry → mineral assemblage + modal %, order
+   │
+   ▼
+[B] Fabric kernels (B1–B5, freely nested)
+   │        writes the PETROFABRIC BUFFER: per-voxel mineral, grain, orientation, age
+   ▼
+[C] Mesostructure             fracture network, differential relief, cleavage facets
+   │◄──────────┐
+   ▼           │  (C↔D alternate for "age" macro-iterations)
+[D] Weathering ┘              alteration fronts, stain transport, dissolution
+   │
+   ▼
+[E] Optics compiler           slice/shell → albedo, normal, roughness, F0, height, AO, SSS
+```
+
+Stages A is CPU-side arithmetic; B–E are GPU compute passes over the slab. Target platform: WebGPU, single-file HTML with a built-in PBR preview (sphere + plane, orbit light) — same genre as Circulum and Risset Loom.
+
+## 2. The slab
+
+The domain is a thin 3D voxel grid, default **512 × 512 × 32**, toroidal in X and Y (all distances, deposition, and stain transport wrap; output tiles seamlessly), open in Z. Z is depth: `z_top(x, y)` is a height field defining the exposed surface, initialized flat ("sawn") and carved by stages C/D.
+
+A physical scale `mm_per_voxel` (default 0.1 mm — hand-sample scale) makes texel density physically meaningful: a 2 mm feldspar phenocryst spans 20 voxels; Wentworth grain size ties in directly since diameter in mm = 2^(−φ). Choosing scale is choosing what is *resolved* versus *statistical* (see §5.4).
+
+Two output modes slice the slab differently. **Outcrop mode** projects the `z_top` shell to 2D with full height/weathering channels. **Polished mode** takes an interior plane z = const with roughness clamped low and facets off — countertop granite, and incidentally the cleanest surface for validating albedo against photographs. Because the fabric is volumetric, re-slicing after a virtual fracture yields consistent interiors for free — the reason we chose a slab over a 2D field.
+
+### 2.1 Petrofabric buffer (per voxel)
+
+```
+struct Voxel {
+  mineral_id  : u8      // index into mineral DB; 0 = pore/air, 1 = glass
+  grain_id    : u32     // unique per grain; hash(grain_id) seeds per-grain randoms
+  orientation : 4×snorm16  // unit quaternion, crystal frame → slab frame
+  t_impinge   : f16     // crystallization/deposition order (zoning, interstitial detection)
+  alteration  : f16     // 0 = fresh … 1 = fully altered (written by stage D)
+  aux         : f16     // phase-dependent: An-content zoning, cement flag, stain load
+}
+```
+
+≈ 18 B/voxel → ~150 MB at 512²×32. Offer 256²×16 preview (~19 MB). Voxels whose expected grain size falls below resolution use the statistical encoding of §5.4 instead of one-grain-one-id.
+
+## 3. Mineral database
+
+A single JSON table drives every downstream stage. Per mineral:
+
+| field | type | consumed by |
+|---|---|---|
+| name, class | string | UI |
+| density ρ | g/cm³ | A (wt% → vol%) |
+| hardness | Mohs 1–10 | C (relief), D (feedback) |
+| habit | polytope: face normals nᵢ + distances hᵢ | B1 (euhedral growth gauge) |
+| cleavage | list of {plane normal (crystal frame), quality ∈ [0,1]} | C (facets), C (crack paths), E (roughness) |
+| fracture | conchoidal / uneven / hackly | C, E |
+| R(λ) | reflectance, 380–730 nm @ 10 nm, from USGS splib07 | E (albedo), validation |
+| grain_bright | fitted slope of reflectance vs log grain size (from splib07 grain-size series) | E |
+| n (+ k if opaque) | refractive index (complex for ore minerals) | E (F0 / metalness) |
+| scatter | single-scattering albedo, mean free path | E (translucency) |
+| alters_to | mineral_id + rate constant k_w | D |
+| stain_yield | Fe³⁺ release per unit alteration | D |
+
+**v1 mineral set (~16):** quartz, K-feldspar (orthoclase), plagioclase (An-parameterized), biotite, muscovite, hornblende, augite (pyroxene), olivine, calcite, dolomite, kaolinite (alteration product), hematite + goethite (stains), magnetite, pyrite, volcanic glass. This covers granite, granodiorite, diorite, gabbro, basalt, rhyolite, obsidian, pumice, sandstones, limestone, marble, slate/phyllite/schist, gneiss, quartzite.
+
+Spectra are integrated offline (§8.1) so the runtime table carries precomputed linear-sRGB plus the retained spectrum for validation and relighting under non-D65 illuminants.
+
+## 4. Stage A — Composition solver
+
+**Input, two entry levels.** High level: a preset name resolving to bulk chemistry. Low level: oxide weight-percents (SiO₂, TiO₂, Al₂O₃, FeO, Fe₂O₃, MgO, CaO, Na₂O, K₂O, …).
+
+**Igneous:** run the **CIPW norm** — the classical, fully deterministic ~40-step allocation algorithm that converts oxide chemistry into normative mineral weight fractions. Convert wt% → vol% via densities. Report the QAPF/TAS classification as a sanity readout ("this melt is a granodiorite"). Crystallization *order* follows Bowen's reaction series: olivine → pyroxene → hornblende → biotite → plagioclase (calcic → sodic, giving An zoning) → K-feldspar → muscovite → quartz. The order list plus per-phase volume quotas is Stage A's entire output contract to B1.
+
+**Sedimentary:** composition is specified directly as a clast recipe (e.g., quartz arenite: 95% quartz grains, silica cement; arkose: 60/25/15 quartz/feldspar/lithics, hematite-tinted calcite cement) or derived from a provenance preset. No solver needed; the physics lives in transport (B2).
+
+**Metamorphic:** (protolith class, T, P) → assemblage via a small hand-built petrogenetic-grid lookup — e.g., the pelite sequence clay → chlorite → biotite → garnet zones. Honest full treatment is Gibbs-energy minimization (THERMOCALC-style); explicitly out of scope, and the lookup table is the declared approximation. The grade parameter also feeds B3's kinetics.
+
+## 5. Stage B — Fabric kernels
+
+### 5.1 B1: `crystallize` — sequential Johnson–Mehl on the GPU
+
+Nucleation-and-growth with impingement *is* a Johnson–Mehl tessellation — this is not a Voronoi-flavored aesthetic choice but the actual geometry of crystallization. Each seed s carries birth time t_s, growth speed g_s, phase p_s, orientation q_s, and habit polytope P (from the mineral DB). Its arrival time at voxel v is
+
+```
+T_s(v) = t_s + γ_P( R(q_s)⁻¹ · (x_v − x_s) ) / g_s
+γ_P(y) = max_i ( nᵢ·y / hᵢ )        — Minkowski gauge of the habit polytope
+```
+
+The gauge makes early, unimpeded crystals genuinely **euhedral** — flat faces, correct interfacial angles — at the cost of a max over ~6–12 face planes per distance evaluation. An ellipsoidal metric (Mahalanobis distance under a habit tensor) is the cheap fallback. A voxel belongs to the seed minimizing T_s(v).
+
+**Sequencing per Bowen.** Phases run in reaction-series order against their Stage-A volume quotas:
+
+```
+claimed ← ∅
+for phase p in bowen_order:
+    scatter N_p seeds in unclaimed space   // N_p from kinetics, below
+    JFA over unclaimed voxels → per-voxel best (seed, T)
+    t* ← quantile of T such that |{T ≤ t*}| = quota_p     // one histogram pass
+    freeze voxels with T ≤ t*: write mineral, grain, orientation, t_impinge = T
+```
+
+Early phases stop at quota with idiomorphic faces intact; the final phase (quartz) inherits whatever interstitial space remains and is therefore **anhedral automatically** — exactly the granite fabric petrologists describe, produced by the mechanism that produces it in nature.
+
+**Kinetics → seed counts.** Rather than integrating nucleation/growth ODEs, use the JMAK/Avrami closed form: mean grain diameter scales as d ∝ (G/I)^(1/4) in 3D (constant rates, Avrami exponent 4), so per-phase seed density is N_p ∝ quota_p / d³ with d set by a monotone map from the cooling timescale τ (slow τ → growth-dominated → phaneritic; fast τ → nucleation-dominated → aphanitic). This map is where petrology is folded in; calibrate presets against published crystal-size-distribution (CSD) data (§10). A **two-stage τ schedule** — slow then fast — yields porphyritic texture with zero additional machinery: stage-1 phases become phenocrysts, stage-2 becomes groundmass. **Zoning:** plagioclase An-content is a function of t_impinge, written to `aux`, read by E as an intra-grain albedo gradient.
+
+**Vesicles:** before crystallization, carve Poisson-disk spheres (radius distribution from a volatiles parameter) as pore voxels; walls may later host amygdale fill (v2). **Glass:** if τ falls below a threshold, skip tessellation entirely — every voxel is `glass`, and obsidian's look comes purely from stage E (conchoidal fracture + dark F0).
+
+**JFA implementation.** Standard jump-flooding (passes at strides N/2, N/4, …, 1) generalizes cleanly: propagate the (seed, T) pair minimizing arrival time instead of Euclidean distance; anisotropic gauges only require that each voxel evaluates T against candidate seeds, which JFA already does. Known JFA artifact rate is acceptable at slab resolution; a final 1-2 stride refinement pass cleans stragglers. Cost: log₂(512) ≈ 9 passes × ~8 phases over 8.4 M voxels — trivially interactive.
+
+**Seeding modes.** Volume-Poisson is the default, but two variants extend coverage substantially at near-zero cost. *Wall-seeded:* scatter seeds on a surface (crack walls, vesicle interiors, brine floor) and grow inward — **geometric selection emerges on its own**, as wall crystals whose fast growth axes point away from the wall outcompete their neighbors. This *is* comb quartz, geode linings (amethyst = wall-seeded quartz in a vesicle), and chevron halite growing up from an evaporite pan. *Point-seeded fibrous:* spherulites (devitrifying rhyolite, chalcedony) use an isotropic gauge but a radial internal fabric — store only the seed position and resolve per-voxel orientation as the radial direction at compile time, so a spherulite costs one seed.
+
+**Melt kinematics.** Two pre-solidification options: `flow` applies a laminar shear warp to the composition and nucleation-density fields before crystallization — flow-banded rhyolite and obsidian are heterogeneous melt that moved, so the warp is the physics, not a domain-warping trick. `settle` lets each phase's just-frozen crystals fall through remaining melt via the B2 falling-sand pass before the next phase runs — honest crystal settling, yielding cumulate layering (modally graded gabbros) as a composition of `crystallize` with `deposit`'s machinery.
+
+### 5.2 B2: `deposit` — transport statistics, settling, diagenesis
+
+The physics enters through the *grain population*, which is where sedimentology actually lives. Sample grain diameters from a log-normal in φ-units: mean φ set by transport **energy** (high-energy rivers carry gravel; quiet basins collect clay), σ_φ = **sorting** (well-sorted beach vs poorly-sorted glacial till). Krumbein **roundness** ρ ∈ [0,1] increases with transport **distance**; realize each clast as a superellipsoid whose corner exponent interpolates angular → rounded with ρ.
+
+**Settling.** v1 uses 2.5D ballistic deposition — a falling-sand pass, per-column atomics, dropping clasts from +z with jitter, resting them on the evolving height field, long axes settling near-horizontal with optional imbrication if a current direction is set. (This is deliberately the one stage built on falling-sand mechanics; it is the natural primitive here.) Full 3D rigid-body packing is the v2 upgrade; the visual delta at texture scale is modest.
+
+**Bedding** is nothing extra: let (mean φ, composition, current direction) vary with deposition time — a slow signal gives graded beds and laminae, a periodically re-inclined deposition surface gives cross-bedding.
+
+**Diagenesis.** Compact (vertical affine squash, factor from burial parameter), then cement: pore voxels within radius r of clast surfaces convert to the cement mineral (quartz overgrowth / calcite / hematite film) until a target cementation fraction is met; surviving pores remain `mineral_id = 0` and matter optically (§8.1). Hematite cement is how red sandstone gets red — the color is diagenetic chemistry, not a tint knob.
+
+**Carbonates (v1 minimal):** limestone = micrite (statistical calcite voxels, §5.4) with optional sparry patches; ooids (concentric growth shells around nuclei — a one-liner given the gauge machinery) and bioclasts are stubs.
+
+### 5.3 B3: `deform` — Potts recrystallization under stress
+
+Input: any petrofabric buffer as protolith, grade T (mapped to Monte-Carlo temperature and sweep count), and a **velocity gradient L = D + W** — symmetric stretch D plus spin W. The alignment term below uses ŝ = the most-compressive principal axis of D; the spin W additionally rotates grain quaternions a small increment per sweep, so simple shear (mylonites) and coaxial flattening (slates) are the same operator with different L. At high strain rate, add dynamic recrystallization: nucleate small new grains where a stored-energy proxy (accumulated rotation × hardness) is high — grain-size reduction and ribbon quartz, the mylonite signature, follow.
+
+Run a Q-state **Potts model** on grain_id — the standard microstructure-evolution tool in materials science. Metropolis proposal: a voxel adopts a neighbor's (grain_id, orientation); energy is boundary energy plus an alignment term for platy phases:
+
+```
+E = Σ_<ij> J · [grain_i ≠ grain_j]  −  w Σ_{i platy} (c_i · ŝ)²
+```
+
+where c_i is the voxel's crystallographic c-axis (from its quaternion). Under compression, mica c-axes rotate toward ŝ, i.e., basal planes align perpendicular to compression — **foliation**, emerging from a two-term Hamiltonian. Race-free GPU sweeps use an 8-color 3D checkerboard. Phase transformations from Stage A's grid lookup swap mineral_ids at grade-dependent rates during the same sweeps.
+
+The **grade knob** interpolates the real sequence: few sweeps + strong alignment → slate; more sweeps → phyllite → schist (coarsened micas); gneissic **banding** arrives by two honest routes, and no cheat is needed. Route one is free: a large share of natural banding is *transposed inherited layering*, and since `deform` accepts any protolith, `deform(deposit(...))` with bedding produces it with zero new machinery — the recursion earning its keep. Route two, metamorphic differentiation, is modeled as biased unmixing: a Cahn–Hilliard phase-separation term on felsic/mafic identity with mobility enhanced along the foliation plane (§14 shows the identical PDE also buys perthite exsolution and Widmanstätten patterns). The true mechanism of natural banding is genuinely debated in the petrology literature; shipping both routes, each with a defensible physical reading, is the accurate position.
+
+With **no stress bias**, pure Potts coarsening of a calcite or quartz protolith relaxes toward a polygonal foam with ~120° triple junctions — which is precisely the granoblastic texture of marble and quartzite. The model produces the right texture because it is the accepted model *of* that texture.
+
+### 5.4 Statistical voxels (the sub-resolution branch)
+
+At 0.1 mm/voxel, basalt groundmass (grains ≪ 0.1 mm) and micrite cannot be resolved grain-by-grain. Whenever a phase's predicted d < ~2 voxels, skip explicit tessellation for it: voxels store a **phase histogram** (packed into aux + mineral_id conventions) plus a variance seed. Stage E then computes mixture optics — noting that intimate mineral mixtures combine approximately linearly in *single-scattering albedo*, not in reflectance (Hapke); v1 may ship linear-reflectance mixing with the Hapke-space upgrade noted. Effective roughness rises and per-grain facet logic is disabled for statistical voxels. This branch is what makes basalt, micrite, and slate matrices honest rather than accidentally phaneritic.
+
+### 5.5 B4: `precipitate` — reaction–transport from fluids
+
+The constructive counterpart of weathering: stage D's reaction–diffusion machinery writing minerals instead of destroying them. Three modes, one operator.
+
+**Replacement fronts (metasomatism).** A solute concentration field c infiltrates from boundaries and cracks by advection–diffusion; where c exceeds a threshold and the host mineral is in the reactive set, swap mineral_id at rate k. Because cracks are fast-paths (§6), reaction rims advance from the fracture network inward — which is precisely why serpentinite has its **mesh texture** of relict olivine cores inside serpentine rims: the pattern is the transport topology, for free. Dolomitization is the same front with calcite→dolomite; skarn zoning falls out of multiple thresholds keyed to c ranges (sequential reaction zones behind a moving front); chert nodules are silica replacement in limestone.
+
+**Rhythmic precipitation (Liesegang).** Classic supersaturation–nucleation–depletion: solute A diffuses into host containing B; precipitate forms where [A][B] exceeds K_sp times a supersaturation factor, nucleation locally depletes both, the front advances until threshold is re-reached — discrete bands with geometrically increasing spacing. **Self-testing physics:** the Jablczynski spacing law (x_{n+1}/x_n → const) is a measurable output the simulation must reproduce, giving a validation target with zero extra work. Liesegang-ringed sandstone, and the chemistry half of agate.
+
+**Surface accretion.** Level-set growth of an interface along its normal, rate modulated by a time-varying chemistry signal → laminae. Travertine and speleothem banding (accrete outward), crustiform vein fill (accrete inward from both walls, alternating chemistry), ooid cortices (accrete around nuclei, agitation resets orientation). Redistancing reuses the JFA pass — the accretion mode is jump-flooding pointed at a different problem. **Agate** is the flagship composition: vesicle → inward accretion laminae → fibrous chalcedony (point/wall-seeded fibrous mode, §5.1) → optional comb-quartz core. Every stage is an existing primitive.
+
+### 5.6 B5: `unmix` — Cahn–Hilliard exsolution
+
+Subsolidus phase separation, attachable as a cooling tail to `crystallize` or running inside `deform`. Order parameter φ (e.g., Or–Ab fraction within alkali feldspar grains; coarse-grained felsic–mafic identity for gneissic differentiation) evolves by
+
+```
+∂φ/∂t = ∇·( M ∇μ ),   μ = f′(φ) − κ ∇²φ,   f = double-well
+```
+
+with **anisotropic mobility M**: for perthite, lamellae are crystallographically controlled, so M is a tensor aligned per-grain via the stored quaternion and a per-mineral exsolution plane in the DB; for gneiss, M is enhanced in the foliation plane and φ couples back to Potts phase swaps (voxels flip mineral toward the local φ majority). Numerics: explicit stabilized finite differences, single f32 φ channel, 10²–10³ ping-pong steps at slab scale. **Self-testing physics again:** linear spinodal analysis fixes the fastest-growing wavelength λ* = 2π·sqrt(2κ/|f″|), and conserved coarsening must follow the Lifshitz–Slyozov t^(1/3) law — both are assertions the implementation can check about itself. Presets that fall out: perthitic granite (automatic, since alkali feldspar + slow cooling is the default granite path), and an **iron meteorite** — kamacite lamellae unmixing from taenite on the octahedral plane set, rendered in polished mode: etched Widmanstätten as a two-operator program.
+
+### 5.7 Pyroclastic rocks
+
+Tuff is `deposit` with a clast population of glass shards, pumice fragments, and free crystals. **Welding** is the diagenesis squash with temperature-dependent clast softness: hot glassy clasts flatten preferentially into fiamme, producing eutaxitic texture; cold tuff just compacts. One softness-by-phase table entry, no new operator.
+
+## 6. Stage C — Mesostructure
+
+**Fracture network.** Cracks are least-cost paths on the voxel graph where the local edge cost encodes toughness: cost drops sharply when the step crosses a grain boundary (intergranular fracture) and when the step direction lies in a cleavage plane of the local grain (intragranular fracture along cleavage, using the per-voxel quaternion); it is high through unbroken strong minerals. A toughness-ratio parameter picks the intergranular/intragranular regime. Seed crack tips at slab borders and high-stress points, grow by Dijkstra/percolation with branching probability, carve `z_top` along the path with depth ∝ accumulated length. Crack voxels are also registered as weathering fast-paths for stage D. For quartz/glass, decorate fracture faces with concentric ripple arcs around the initiation point — conchoidal fracture is this and only this.
+
+**Differential relief.** Iterate a few Jacobi steps: erode z_top at rate ∝ exposure / hardness(mineral) with curvature smoothing. Soft biotite recesses; quartz stands proud. Hardness is read *after* alteration (kaolinized feldspar erodes like clay, not like feldspar) — this is one leg of the C↔D feedback loop.
+
+**Cleavage facets.** For surface voxels whose mineral has cleavage: rotate the cleavage-plane normals by the grain quaternion, snap the local surface normal toward the nearest cleavage normal with strength ∝ cleavage quality. Fresh-broken feldspar and mica get flat, coherent, glinting faces per grain; quartz (no cleavage) stays conchoidal. Crystal symmetry is handled by storing the full set of symmetry-equivalent planes per mineral in the DB (mica: 1 perfect basal plane; feldspar: 2 near-orthogonal; calcite: 3 rhombohedral).
+
+## 7. Stage D — Weathering
+
+Per-voxel alteration integrates a first-order front:
+
+```
+da/dt = k_mineral · w(x) · (1 − a)
+w(x)  = exp(−depth/δ) · (1 + β·crack(x)) · (1 + γ·(1 − AO(x)))
+```
+
+The moisture proxy w concentrates weathering at the surface, along cracks, and in concavities — the AO term is the trick: bake ambient occlusion on z_top *before* weathering and reuse it as a water-retention prior (hollows stay damp), then re-bake after for the output channel. This deliberately replaces the full Darcy-flow + mineral transport/dissolution/recrystallization simulation of Dorsey et al. 1999 with a surface-field approximation; their paper remains the reference for the volumetric version and the upgrade path if slab-interior weathering ever matters.
+
+**Chemical rules are table-driven** (mineral DB `alters_to`): feldspar → kaolinite (whitens, roughness ↑, hardness ↓ → faster relief erosion); biotite, pyrite, olivine, augite → oxidize, releasing Fe³⁺ (`stain_yield`) — this is why basalt and mafic minerals go brown first; calcite → dissolves outright, removing voxels (pitting; with a drainage-direction bias, karren grooves).
+
+**Stain transport.** Released iron obeys an advection–diffusion–deposition pass on the surface: velocity = downslope gradient of z_top, plus diffusion, with distance-decaying deposition into `aux`. Result: rust streaks bleeding below every biotite cluster and pyrite cube — the single most recognizable signature of real weathered granite. Ping-pong compute passes, identical machinery to any reaction–diffusion toy.
+
+**Age loop.** Alternate C and D for 4–8 macro-iterations under an `age` parameter: weathering softens, erosion strips, fresh material exposes. Lichen/biofilm is explicitly v2 (DLA or Gray–Scott colonies seeded by moisture, masked by substrate chemistry).
+
+## 8. Stage E — Optics compiler
+
+Resolve the slab (outcrop shell or polished slice) into 2D channel maps. Every texel gathers its voxel's fresh mineral and alteration product, lerped by a, then:
+
+**8.1 Albedo (spectral, offline-integrated).** Per mineral: take R(λ) from USGS splib07 (measured 0.2–200 μm; we retain 380–730 nm), multiply by the D65 illuminant, integrate against the CIE observer functions to XYZ, convert to linear sRGB. Precomputed into the DB; runtime is a table lookup + lerps. Retaining spectra enables (a) relighting under arbitrary illuminants without metamerism errors and (b) direct validation against splib07's *rock* spectra (§10). Corrections applied per texel: **grain-size brightening** (finer grains scatter more; slope fitted per-mineral from splib07's grain-size series — the library ships these on purpose), **porosity darkening** (pore fraction traps light), **zoning** (An-content gradient in plagioclase), **stain overlay** (hematite/goethite spectra composited by `aux` load — thin-coating composite, not opaque replacement).
+
+**8.2 Specular F0 / metalness.** Dielectrics: F0 = ((n−1)/(n+1))² from the DB index — quartz n≈1.55 → 0.046; nearly all rock lands in F0 ∈ [0.035, 0.06], which is itself a physical-accuracy statement (rocks are not shiny, they are *faceted*). Ore minerals with complex IOR use the conductor Fresnel F0(λ) = ((n−1)² + k²)/((n+1)² + k²) evaluated per RGB → pyrite genuinely reads brassy-metallic. Metalness map is therefore *not* identically zero, just almost.
+
+**8.3 Roughness.** Base per mineral by surface type: cleavage faces low α (glossy facets), conchoidal moderate with ripple modulation, granular/statistical high. Alteration lerps toward the product's roughness (kaolinite coat ≈ 0.85+). Sub-texel grain size adds micro-roughness. Polished mode overrides to a uniform low α with per-mineral polish response.
+
+**8.4 Normal / height / AO.** Height = normalized z_top; normal = Scharr on height composited with intra-grain cleavage-facet normals; AO = horizon-based bake on z_top (also consumed by D, order per §7).
+
+**8.5 Translucency.** Per-mineral scattering parameters × local grain size → a thickness/translucency channel. Matters visibly for calcite (marble is *the* SSS material), quartzite edges, gypsum; ignorable elsewhere.
+
+**8.6 Glints — declared limitation.** Real rock sparkle is discrete specular events from individual cleavage facets; a roughness map cannot represent it under a moving light. Options, in ascending fidelity: (a) rely on facet normals + low roughness (adequate when texel ≈ facet, i.e., coarse rocks at hand-sample scale); (b) emit an auxiliary glint density/orientation map for a dedicated glint BRDF on the renderer side; (c) accept matte output for weathered outcrop, where nature has already destroyed the facets. v1 ships (a) + the map for (b).
+
+## 9. Parameter schema
+
+```jsonc
+{
+  "slab":   { "size": [512,512,32], "mm_per_voxel": 0.1, "tile_xy": true, "seed": 0xB33 },
+  "rock": {
+    "op": "deform",                       // crystallize | deposit | deform | precipitate
+                                          // (unmix + settle/flow attach as sub-blocks)
+    "T": 550, "P": 4, "stress": { "axis": [0,0,1], "mag": 0.7 },
+    "protolith": {                        // operators nest — the rock cycle is recursive
+      "op": "crystallize",
+      "chemistry": { "preset": "granite" },        // or explicit oxide wt%
+      "cooling":   [ { "tau": 1e5 } ],             // list of stages; 2 stages → porphyritic
+      "volatiles": 0.0
+    }
+  },
+  "weathering": { "age": 0.4, "humidity": 0.6, "cut": "outcrop" },   // or "fresh" | "polished"
+  "output": { "channels": ["albedo","normal","roughness","height","ao","f0","translucency"],
+              "resolution": 2048 }
+}
+```
+
+The recursion is the design's center of gravity: the schema *is* the operator algebra of §0, and every classic rock name is a short program. Ship ~28 presets as named programs: granite (perthitic by default), granodiorite, gabbro, cumulate-layered gabbro, basalt, obsidian, flow-banded rhyolite, porphyritic rhyolite, pumice, welded tuff, pegmatite (flagged: kinetics map overridden, see §14), quartz arenite, arkose, red sandstone, conglomerate, breccia, shale, limestone, coquina, dolostone, travertine, chert, rock salt (chevron), marble, slate, schist, mylonite, gneiss, quartzite, serpentinite, agate geode, Liesegang sandstone, anthracite, iron meteorite (Widmanstätten).
+
+## 10. Validation — receipts for "physically accurate"
+
+**By construction:** output modal % equals the CIPW target exactly (the quota threshold enforces it).
+
+**Fabric statistics:** crystal-size-distribution (CSD) plots — log population density vs size — are a standard petrological instrument with published curves; generate them from the grain map and compare slopes against literature values for given cooling regimes. Grain-size/sorting histograms for sedimentary output check directly against the sampled Wentworth targets (round-trip test of the deposition stage).
+
+**Color:** splib07 contains measured spectra of whole *rocks*, not only minerals. Generate granite, integrate the polished-mode albedo back to a spectrum (we kept spectra for exactly this), and compare against a measured granite spectrum; likewise render swatches under D65 next to hand-sample photographs.
+
+**Virtual thin sections (the showpiece).** The slab already stores per-grain crystallographic orientation, and the mineral DB can carry birefringence. A 30 μm slice between crossed polarizers is then renderable: interference color from retardation = birefringence × thickness via the Michel–Lévy chart, extinction as the stage rotates. Comparing synthetic XPL images against real thin-section micrographs is simultaneously the strongest qualitative validation available and an extremely beautiful demo mode. Petrographers could, in principle, grade the output with their actual professional toolkit.
+
+## 11. GPU implementation plan
+
+WebGPU compute throughout; a single ~2–3 kLOC HTML file. Pass graph: JFA (9 passes × ≤8 phases), quota histogram (1 pass/phase), deposition (2.5D atomic falling-sand or CPU fallback), Potts sweeps (8-color checkerboard, O(10²–10³) sweeps at grade), crack growth (iterative frontier expansion), relief Jacobi (≤16), weathering + stain ping-pong (O(10²) steps × age iterations), C–H unmix (explicit, 10²–10³ steps, single f32 channel), precipitate (RD ping-pong for fronts/rhythms; level-set accretion via JFA redistance), channel resolve (1 pass/channel), plus a preview renderer. All randomness from counter-based hashes keyed (seed, voxel, pass) — identical params reproduce the identical rock bit-for-bit, which matters for shareable presets. Budget estimate: preview res well under a second end-to-end on a desktop GPU; 512² slab in low single-digit seconds; Potts sweeps and C–H at high grade are the long poles.
+
+## 12. Risks and open questions
+
+**Gneiss banding** (§5.3): decision made — honest Cahn–Hilliard segregation plus the inherited-layering route; the quota-modulation cheat is dropped. Risk shifts to C–H tuning (mobility anisotropy, sweep budget) and to validating band wavelength against measured gneisses. **Deposition** is the one stage that resists clean parallelism; the 2.5D falling-sand compromise trades 3D packing fidelity for tractability — probably invisible at texture scale, but unproven. **Kinetics calibration** (τ → grain size) is a hand-built map wearing physics clothing until CSD-fitted; presets should record their provenance. **Intimate-mixture optics** for statistical voxels: linear-reflectance mixing is wrong in a known direction (Hapke single-scattering-albedo space is the fix); decide after seeing basalt v1. **Quaternion storage** at f16×4 may band the facet normals; snorm16 packing or octahedral-frame encoding if visible. **New operators:** C–H is stiff — the explicit scheme needs small Δt (budget the sweep count and assert the t^(1/3) coarsening law as a runtime check); level-set accretion aliases laminae thinner than ~2 voxels — clamp band frequency to resolution or supersample the accretion field locally. **Serpentinization volume change** (~+40% in nature) is ignored; if mesh textures look too tight, a mild dilation term is the honest patch.
+
+## 13. Milestones
+
+M0: slab infra + JFA-JMAK + 3 minerals + flat optics → recognizable pseudo-granite. M1: CIPW + Bowen sequencing + spectral albedo → true granite/granodiorite/gabbro family, polished mode, first color validation. M2: mesostructure + weathering loop → outcrop granite with rust streaks (the money shot). M3: deposit kernel → sandstones, shale, limestone, tuff. M4: Potts + kinematic deform + C–H unmix → marble, slate, schist, mylonite, gneiss, perthite, iron meteorite. M5: `precipitate` (fronts, rhythms, accretion) + seeding modes → agate geodes, serpentinite, dolostone, travertine, Liesegang sandstone, veins, rock salt. M6: melt kinematics (flow banding, cumulates) + welded tuff + spherulites. M7: content packs — bioclast SDF library (coquina, fossiliferous limestone), organic macerals with rank→reflectance mapping (peat through anthracite), lichen colonies as an optional stage-D pass (Gray–Scott masked by moisture and substrate chemistry). M8: virtual thin sections + full validation suite + preset gallery. M9: fracture-physics pack (contraction cracking, shock, pressure solution, folding, soft-sediment) → columnar basalt, septaria, shatter-cone impactite, stylolitic limestone, folded marble, load-cast sandstone. M10: Laplacian growth + extended optics channels (iridescence, anisotropy, emission, fluorescence, wet) + planetary tables + templates → labradorite, moonstone, opal, tiger's eye, komatiite, Mn-dendrite limestone, fulgurite, petrified wood, stromatolite, chondrite, pallasite, glacier ice, lunar regolith. The gallery grows toward ~45 presets. M11: isosurface outcrop representation + thermal fields τ(x) + flow-sculpted dissolution, directional abrasion, unloading cracks, finishes → tafoni test, pillow basalt, chilled-margin dike, scalloped limestone, ventifact, exfoliating granite dome, polished/flamed slabs. M12: instrument targets (UV, CL, BSE, TIR) + chromophore/inclusion/tarnish pack + reaction rims + structural layer + Wang tile emission + NDF-derived roughness + inverse-petrology harness → smoky pegmatite, milky quartz vein, peacock bornite, corona gabbro, and presets fitted directly from photographs. M13 (optical volume): the spectral transport renderer over derived coefficient fields, with projection heads for gems (ballistic), marble (diffusive), fitted-PBR bake (opaque), polarized thin sections, and instrument modes → ruby, star ruby, zoned sapphire, sector-zoned amethyst, fancy-color diamonds, emerald with jardin, and PBR maps that are photographs of virtual samples. M14 (ab initio basement, optional): provenance-tagged DB + Materials Project dielectric-tensor priors + Mie-from-fabric scattering + pilot GW+BSE set (quartz, calcite, corundum, diamond) → splib07 graduates from input to validation.
+
+## 14. Coverage audit — what the four verbs miss
+
+Auditing by *process* rather than rock name, the gaps collapse into a short list, and most of them are one PDE and one verb away.
+
+**Unmixing (exsolution).** Perthite — the albite lamellae that stripe nearly every slowly cooled alkali feldspar, visible in hand sample — is subsolidus phase separation, as are Widmanstätten patterns in iron meteorites and various fine intergrowths. The model is Cahn–Hilliard, a ping-pong-able fourth-order PDE. Since the honest gneiss-banding decision (§5.3) already commits to a C–H term, exsolution textures come nearly free: same primitive, different phase pair and mobility tensor. Add `unmix[χ, M]` as a sub-operator of `deform`/`crystallize` cooling tails.
+
+**Constructive precipitation.** Agate banding, travertine and speleothem laminae, Liesegang rings in sandstone, concretions, dolomitization fronts, and the metasomatic family (serpentinite mesh texture, skarn) are all precipitation/replacement from fluid — reaction–diffusion run *constructively*, i.e., stage D's machinery writing minerals instead of dissolving them, sometimes coupled to surface-normal accretion. This is the genuine fifth verb: `precipitate[chem, front]`. Notably, hydrothermal **veins and geodes need no new verb at all**: seed `crystallize` on crack or vesicle walls and geometric selection emerges on its own — wall-nucleated crystals whose fast axes point inward outcompete the rest, which is exactly comb quartz; an amethyst geode is `vesicle + wall-seeded crystallize`, a composition of existing machinery.
+
+**Melt-present flow.** Flow-banded rhyolite is a pre-solidification shear warp of the composition field (cheap). Cumulate layering is `crystallize` composed with settling — i.e., `deposit` acting on crystals inside melt (a composition, not a new verb). Welded tuff is `deposit` of glass shards plus hot compaction with fiamme flattening (the diagenesis squash, anisotropic). **Migmatites are the honest holdout**: partial melt segregation is two-phase flow, and no cheap primitive fakes it defensibly. Declared out of scope.
+
+**Kinematics.** `deform` currently takes a compression axis; mylonites (ductile shear zones: ribbon quartz, extreme dynamic grain-size reduction) need the full stress tensor with a rotational component. Parameter generalization, not new physics.
+
+**Content, not physics.** Fossiliferous limestone and coquina need a bioclast shape library; coal needs organic macerals in the DB (amusingly, vitrinite *reflectance* is the literal industry proxy for coal rank — the optics compiler would be speaking the native language); lichen ships as an optional stage-D colony pass. These are asset problems the architecture already accommodates, scoped as the M7 content pack.
+
+**Parameter-regime breaks.** Pegmatite fabric is mechanistically covered (very low nucleation density) but the τ → grain-size map is wrong for it — pegmatites are flux-driven (H₂O/Li/B/F), not slow-cooled, and their crystals exceed the slab at hand-sample scale anyway. Spherulitic devitrification in glassy rocks needs a radial-fibrous growth mode: a small extension to the gauge machinery, not a redesign.
+
+**Audit conclusion:** `precipitate` and `unmix` are now first-class operators (§5.5–5.6), kinematic `deform`, seeding modes, melt kinematics, and pyroclastics are folded in (§5.1, §5.3, §5.7), and biogenic rocks are scoped as content (M7). Coverage is therefore most of rock space — though a second, more hostile audit (§15) finds the corners this claim missed. The irreducible residue: **migmatite** (two-phase melt segregation — genuinely hard physics, honestly declined) and full Gibbs-minimization phase equilibria (the petrogenetic-grid lookup is the declared approximation).
+
+## 15. Second audit — the remaining dark corners
+
+A hostile re-review of §14's coverage claim. The residual gaps fall into five families, and — remarkably — the largest one is not missing physics but missing *eyes*.
+
+### 15.1 The compiler's missing eyes
+
+Several "impossible" rocks turn out to be **fabric-covered already** and fail only at the output stage. **Labradorite** is the crown jewel: labradorescence comes from Bøggild exsolution lamellae in plagioclase — which `unmix` already generates, with C–H even predicting the lamellar wavelength λ*. Thin-film interference color is a function of exactly that spacing, so emitting a thin-film thickness + IOR channel (the KHR_materials_iridescence / OpenPBR convention) where lamellae exist yields **structural color computed from the simulated microstructure** — the schiller's hue is a first-principles output, not a paint job. Moonstone's adularescence (cryptoperthitic scattering) rides the same channel. **Opal** is `deposit` of monodisperse silica spheres in quiet water; packing-domain order gives Bragg diffraction — fabric machinery already exists, only the iridescence output was missing. **Chatoyancy** (tiger's eye, satin-spar silk, ribbon-mylonite sheen) needs tangent + anisotropy maps — and fibrous fabrics already *store* per-voxel fiber orientation; the compiler just never wrote it down. Cheap additions rounding out the eye: **emission** (blackbody T→color for molten/fresh-flow mode; a UV-fluorescence DB field for a lamp mode — calcite, fluorite, willemite), and the **wet variant** (albedo darkening + water-film F0), promoted from out-of-scope.
+
+### 15.2 Fracture physics stage C doesn't have
+
+The crack solver grows fractures from seeds; several iconic patterns need different mechanics. **Contraction cracking** — hierarchical energy-relaxation tiling with the documented T→Y junction maturation (Goehring & Morris) — covers mudcracks, columnar-basalt colonnade cross-sections, septarian interiors, and perlitic onion cracks in glass with one new crack mode. **Shock**: `shock[P]` as a radial conical fracture field plus local vitrification gives shatter cones (striated conical fractures, *the* diagnostic impact texture), suevite breccia, and tektite glass. **Pressure solution** is the anti-`precipitate`: stress-localized dissolution at grain contacts accumulating insoluble residue — stylolites, whose self-affine seam roughness is studied quantitatively in the physics literature and thus becomes another self-test. **Folding**: fabric-scale deform doesn't buckle layers; a displacement-field operator with viscosity-contrast buckling at the Biot dominant wavelength λ_d = 2πh(μ₁/6μ₂)^(1/3) gives folded marble and gneiss (crenulation cleavage, pleasingly, is already free: compose two `deform`s). **Soft-sediment deformation**: load casts and flame structures are Rayleigh–Taylor fingers from density inversion — a fluid-rheology `deform` variant; bioturbation is a stochastic rework pass on laminae.
+
+### 15.3 Growth morphologies crystallize can't grow
+
+The gauge produces compact convex crystals; fibrous mode covers spherulites; but **dendritic/skeletal growth** — the Mullins–Sekerka instability — is absent, and it owns some showpieces: manganese-oxide ferns on limestone, komatiite spinifex (skeletal olivine blades), hopper halite. The minimal model is **Laplacian growth** (DLA and the η-family) — and the same primitive, run as dielectric breakdown (DBM), traces the branching discharge path of a **fulgurite**, which is then just vitrify-along-path through deposited sand. One classic primitive, three phenomena. **Eutectic coupled growth** (graphic granite's runic quartz–feldspar intergrowth) is interface-coupled bi-phase crystallization, Jackson–Hunt style; v1 may approximate it with an unmix-like lamellar pattern, declared as such — mechanism debated in petrology anyway.
+
+### 15.4 Environment regimes
+
+Weathering chemistry is Earth-water-hardwired only in its *tables*. **Planetary regimes** are table swaps: lunar space weathering (nanophase-iron darkening/reddening, agglutinate glass welding — micrometeorite gardening as the moisture analogue), Mars oxidation. **Ice is a rock** and the verbs already know it: glaciologists describe glacier ice as metamorphic — snow→firn→ice is sintering, i.e., Potts coarsening; bubbles are vesicles; the blue is SSS. One DB entry plus a heavy translucency path.
+
+### 15.5 Templates, and predictions the model owes us
+
+Petrified wood is `precipitate` replacement acting on a wood-anatomy template (rings, rays, cell grid — content); stromatolites are accretion with a light-seeking rate function; concrete, brick, and slag are compositions of existing verbs wearing hard hats. Finally, the second audit surfaces **falsifiable predictions**: honeycomb **tafoni** should *emerge* from the existing moisture–AO feedback loop (shadowed hollows stay damp and weather faster — if honeycombs don't appear at the right parameters, the feedback is mis-tuned); porphyroblast growth under spin W should record **snowball-garnet inclusion trails**; stylolite roughness should reproduce its published scaling. A model that makes predictions is worth more than one that only makes textures.
+
+**Updated residue:** migmatite (unchanged), pahoehoe/aa surface fluid dynamics (ropy skin-buckling may partially reuse the fold operator; flagged partial), full Gibbs equilibria. Everything else above is scoped into M9–M10.
+
+## 16. Third audit — solver taxonomy, a caught bug, and the long tail
+
+**Taxonomy ruling.** Laplacian growth is a *solver*, not verb #7. Verbs are typed by their petrofabric semantics; Laplacian growth is invoked by three different verbs (dendritic `crystallize`, dendritic `precipitate`, DBM path-routing for fulgurites) — the signature of a shared computational primitive. The design therefore names its **solver library** explicitly: {JFA, RD ping-pong, Potts/Metropolis, Cahn–Hilliard, Laplacian growth}. Six verbs, five solvers.
+
+### 16.1 A bug this audit caught
+
+§15 predicted tafoni should emerge from the moisture–AO feedback — but §6's surface is a single-valued height field z_top(x,y), **which cannot represent an overhang**. The model's own prediction didn't fit its data structure. Fix, superseding the height-field reading of §6: the outcrop surface is the **voxel occupancy isosurface**; erosion and dissolution remove voxels, not height. The height *map* output becomes a projection of the isosurface (with AO carrying cavity information), and normals come from the occupancy gradient. Cost is modest — the slab was volumetric all along; only stage C/D's surface bookkeeping changes. Cavernous weathering, undercut ledges, and honeycomb cells are now representable, so the tafoni prediction is testable rather than vacuously false.
+
+### 16.2 Thermal fields, not thermal scalars
+
+Cooling rate τ is currently a scalar per stage — but real igneous bodies have margins. Making τ a *field*, τ(x) = f(distance to contact), yields with one change: chilled dike margins, pillow-basalt glassy rinds with inward-coarsening interiors, contact-aureole grain-size gradients in hornfels, and finer porphyry rims. An avoidable miss; promoted immediately.
+
+### 16.3 Sculpting the missing surfaces
+
+Three surface-process families stage C/D lacked. **Flow-coupled dissolution**: thin-film water flow modulating dissolution rate produces scallops (whose wavelength inversely records flow speed — a paleoflow self-test), rillenkarren, and flutes; a free-boundary dissolution mode on the new isosurface. **Directional abrasion**: erosion weighted by exposure to a wind/ice direction gives ventifact facets, desert polish, and glacial polish with striations (striae as directional scratch strokes). **Unloading cracks**: a surface-parallel fracture family (sheeting joints) completes exfoliation and spheroidal-weathering corestones, which alteration fronts alone could not finish. Related additions: efflorescence (salt precipitating at the evaporation front — the same haloclasty physics that drives tafoni), displacive growth (crystals pushing rather than replacing host: chicken-wire anhydrite, enterolithic folds), and **architectural/natural finishes** as a surface post-pass (polished / honed / flamed / sawn / bush-hammered; glacial and desert polish reuse it).
+
+### 16.4 The instrument compiler
+
+Reframe: PBR is *one compile target*. The petrofabric supports others nearly free — crossed-polarizer thin sections (§10, already planned), UV fluorescence, **cathodoluminescence** (which distinguishes quartz overgrowths from detrital cores — a direct visual validation of the diagenesis stage), **BSE contrast** (mean atomic number, trivially computable from composition — SEM imagery for free), and thermal-IR emissivity (splib07 extends to 200 μm). One fabric, many instruments; each extra instrument is another axis on which the simulation can be checked against reality.
+
+### 16.5 Chromophores, inclusions, films
+
+Color *causes* the DB didn't model: **irradiation color centers** (smoky quartz tinted in proportion to dose from neighboring U/Th-bearing accessories — spatially causal color, a provenance-consistent detail); Cr³⁺/Fe²⁺–Ti⁴⁺ variety spectra as DB entries (ruby, sapphire, emerald-green minerals). **Fluid inclusions**: vein quartz is milky *because* fast growth traps micro-inclusions that scatter — one crystallize parameter (growth rate → inclusion density → scattering) explains white veins vs clear rock crystal. **Tarnish**: bornite/chalcopyrite peacock iridescence is a thin oxidation film — free once the §15 thin-film channel exists, driven by the weathering clock. **Reaction rims**: pairwise boundary reactions (mineral A|B → corona C) via a boundary-detect + grow pass — kelyphite around garnet, myrmekite fringes. **Oscillatory zoning** may emerge by coupling growth to local melt depletion (optional, self-organization welcome). **Biological films**: Tintenstriche — the dark cyanobacterial drainage streaks on cliff faces — are geometrically identical to the Fe-stain advection already built; a second source term and palette.
+
+### 16.6 Scale and emission
+
+Above the slab: a lightweight **structural layer** (joint sets, bedding orientation, fold trains) that spatially modulates slab parameters, so cliff-scale texturing composes from hand-sample physics; also a fabric-vs-slab rotation so cuts can cross foliation at any angle. Below the texel: **self-calibrating roughness** — run a small high-resolution patch per (mineral, state), prefilter its normal distribution LEAN/LEADR-style, and *derive* the roughness values §8.3 currently hand-sets. Output-side: emit **Wang tile sets** by constraining JFA/CA boundary conditions per edge class, giving non-repeating infinite coverage from one program (the fabric-matching constraint is a boundary condition, not a post-process); and since every stage is time-stepped, **aging keyframes** (and wet/snow/frost transient states) export nearly free.
+
+### 16.7 Inverse petrology
+
+The calibration story becomes a harness: fit program parameters to reference photographs by black-box search (CMA-ES; the forward model runs in seconds) against texture-statistic + color losses (Portilla–Simoncelli / Gram features, spectra-aware color histograms, height-spectrum slope). This yields presets-from-photos, priors over rock programs, and the strongest validation available: *can the model reach reality, and with geologically sensible parameters when it does?*
+
+### 16.8 Database tiering and residue
+
+The mineral DB roadmaps from 16 to ~60 in visual-leverage tiers (tier 2 urgently wants garnet, chlorite, epidote, serpentine, glauconite, zeolites for amygdales, chalcopyrite/bornite, galena, sphalerite, graphite, gypsum/anhydrite, halite, fluorite, barite, chromite, siderite, corundum, diamond, rutile, spinel). **Residue after three audits:** migmatite (unchanged), pahoehoe/aa surface fluid dynamics (partial — ropy skins may reuse the fold operator), full Gibbs equilibria, and a shrinking but honestly nonzero set of unknown unknowns.
+
+## 17. Single crystals and gems — Lapidary mode
+
+"Does this cover ruby and diamond?" splits into two questions.
+
+**Gem-bearing rocks: yes, mostly already.** Mogok-type ruby is corundum porphyroblasts grown during metamorphism of impure carbonate — a program the algebra already writes: `deform(deposit(carbonate + Al,Cr impurities))` with corundum in the porphyroblast set. Diamond's host needs one composition: **kimberlite** is a volatile-driven breccia pipe — xenoliths and serpentinized olivine macrocrysts in a fine matrix, i.e., `deposit`-style clast machinery inside a `crystallize` groundmass, with diamond as a xenocryst clast species. Corundum, diamond, rutile, and spinel join the DB (§16.8). Diamond's entry is fun on its own: n = 2.417 gives F0 ≈ 0.17 — adamantine luster is a *number* — and resorption in the kimberlite magma rounds octahedra toward dodecahedroids, which is single-crystal dissolution, machinery we have.
+
+**Gems as objects: a genuine representational boundary — the deepest "not covered" of all four audits.** PBR texture maps describe surface reflectance of effectively opaque materials. A cut gem's appearance — brilliance, fire, scintillation, color saturation that varies with ray path length — is volumetric spectral light transport through a transparent single crystal: refraction, dispersion, total internal reflection, pleochroic absorption. No texture map can hold it; this is a limit of the *output representation*, not of the physics stages.
+
+**But the fabric machinery covers gem interiors almost completely**, which motivates a single-crystal mode: one seed, unimpeded gauge growth, history recorded volumetrically. Then, delightfully: **sector zoning falls out of the gauge argmax** — γ_P already computes which habit face claims each voxel, and that face identity *is* the growth sector (amethyst's sector-zoned color, diamond's cuboctahedral CL sectors — visible under the §16.4 CL instrument — for free). Growth/color zoning from shell time (sapphire's hexagonal banding); rutile silk via the fibrous solver along crystallographic axes — three directions at 60° in corundum's basal plane — which the anisotropy channel turns into **asterism** when the virtual cut is a cabochon (star ruby as an emergent consequence of two existing subsystems); "fingerprints" as crack + `precipitate` healing; trigons as etch dissolution on octahedral faces; §16.5 chromophores supply Cr³⁺ ruby red, N-yellow, B-blue, and irradiation-green diamond. And under the existing UV instrument mode, **ruby glows red for free** — Cr³⁺ R-line emission at 694 nm, the ruby-laser transition, already implied by the fluorescence DB field.
+
+**Compile target #7: the gem renderer.** Output a volumetric optical description — spectral absorption field κ(λ, x), IOR + birefringence tensor, inclusion list — plus facet geometry (standard cut libraries or rough habit), consumed by a small spectral refractive path tracer with dispersion (fire) and, ideally, polarization (pleochroism: ruby's o/e dichroism). A single-file WebGPU spectral tracer for a convex faceted solid is a contained, tractable rendering project.
+
+Scoped as **M13 — Lapidary**: single-crystal mode, gem DB entries, the volumetric gem target + spectral tracer → ruby (with silk, fingerprints, star cabochon), sapphire (zoned), amethyst (sector-zoned), diamond (sectors under CL, trigons, fancy colors), emerald (jardin = healed-fracture gardens).
+
+## 18. The optical volume — demoting PBR from canon to projection
+
+Freed from the texture-map assumption, the right canonical representation is: **the slab as a piece of virtual matter** — occupancy plus spectral, anisotropic optical-coefficient fields — with every output, PBR included, a *projection* of it.
+
+**The representation.** Per voxel, derived on demand from (mineral_id, orientation, alteration) + the DB — nothing new is stored; the petrofabric *is* the compression: spectral absorption κ(λ,x); scattering σ_s(λ,x) with phase function (fluid inclusions, micro-porosity); the **dielectric tensor** ε(λ,x) — per-mineral principal indices (uniaxial: calcite, quartz, corundum; biaxial: feldspars, olivine) rotated by the stored quaternion, so birefringence, pleochroism, and optic-axis behavior come from data the fabric already carries; emission response (fluorescence excitation→emission pairs, blackbody for melt). Appearance is then *never authored*: it is the solution of light transport through this medium.
+
+**The unification.** Opacity is the high-absorption *limit* of this representation; PBR surface maps were always a boundary-layer approximation valid when the mean free path is far below feature scale. One dial — optical depth — spans the whole project: diamond (ballistic + refraction), marble (diffusive), granite (opaque boundary). Gems, SSS, virtual thin sections, UV/CL instruments, and rasterizer texture maps stop being separate channels and become **transport regimes and response functions of one object**. §17's gem tracer generalizes into *the* renderer; Lapidary is its ballistic corner. Gems are in fact the renderer's easy case — homogeneous interior, facet boundary, sparse inclusion list — while granite is the case that justifies baking, since rays die within microns of the surface.
+
+**Two-scale honesty.** Geometric transport is the backbone; where fabric scale approaches λ, local wave-optical response models take over with parameters *taken from the simulated fabric*: thin-film matrices on unmix lamellae (labradorite), Bragg response on opal's sphere packing, diffraction on fine laminae. §15.1's iridescence channel is retroactively revealed as this hybrid, now stated as principle rather than patch.
+
+**Polarization plan.** v1 tracks the two eigenpolarizations through birefringent media (sufficient for pleochroism, gem dichroism, and XPL thin sections); full Mueller-matrix transport is the declared upgrade if XPL fidelity demands it.
+
+**PBR, demoted and improved.** The §8 direct compile survives as the *fast opaque-limit projection*. Its principled successor is **fitted PBR**: render the optical volume under a probe rig and fit microfacet parameters per texel — the texture maps become *measurements of a virtual sample*, self-consistent with the volume by construction. We stop painting rocks and start photographing virtual ones.
+
+**DB upgrades required.** Sellmeier n(λ) coefficients per mineral (dispersion — diamond's fire is a Sellmeier curve, not a scalar); *transmission/absorption* spectra for transparent minerals (diffuse-reflectance data like splib07 is the right source for opaque projection but converts to κ only approximately, via Kubelka–Munk — the honest note is to source both where available); fluorescence excitation–emission pairs; tensor symmetry class.
+
+**Engineering.** Hero-wavelength spectral Monte Carlo over voxel DDA traversal on WebGPU; refractive events at the occupancy boundary and at inclusion interfaces; diffusion approximation as an accelerator in the marble regime. M13 accordingly generalizes from "gem tracer" to "optical-volume renderer," with the PBR bake, thin-section, instrument, and Lapidary targets as its projection heads.
+
+## 19. The ab initio basement — how far first principles reach
+
+The DB's optics column is not fundamental; every entry is a view of one master object, the complex dielectric function ε(ω), and much of it is computable from the crystal structure alone. This section records how deep the derivation goes, where it stops, and what the pipeline does about it.
+
+**Dispersion is the shadow of absorption.** Kramers–Kronig ties n(λ) to the absorption spectrum over all frequencies: the Sellmeier poles are not fitted mysteries but literally the UV electronic and IR phonon resonances. Compute the absorption structure and dispersion follows — diamond's fire is a property of its band structure. Computing ε with the crystal's actual symmetry yields the *tensor*, i.e., birefringence ab initio.
+
+**The method ladder** is mature: DFT gives band structure but underestimates gaps by ~30–50%; GW corrects quasiparticle gaps to ~0.1–0.3 eV; BSE adds excitonic effects, which matter substantially in wide-gap insulators like most minerals. GW+BSE is the gold standard for crystal optical spectra; DFPT supplies the phonon side — IR response and reststrahlen bands, which is the §16.4 TIR emissivity channel from first principles. Honest accuracy: computed n typically lands within a few percent — which sounds excellent until noted that 2% of quartz's 1.55 is Δn ≈ 0.03, visually meaningful for dispersion; and birefringence, being a difference of two large numbers, is the hardest optical target. Good, not gemologically calibrated.
+
+**Color is defect physics**, and that field received an enormous windfall from quantum-computing research: the NV center made diamond point defects the most-calculated objects in condensed matter, so diamond's fancy colors are the best-computed colors of anything. The showpiece: the **ruby/emerald puzzle is solved ab initio** — the same Cr³⁺ ion is red in corundum and green in beryl purely from crystal-field differences at the substitution site, reproduced by embedded-cluster multireference calculations; even the pressure shift of ruby's R-line (the fluorescence gauge used inside diamond anvil cells — ruby measuring pressure inside diamond) has been computed. Weakest link: blue sapphire's Fe²⁺–Ti⁴⁺ intervalence charge transfer, a strongly correlated pair problem where calculation still delivers mechanism more than quantitative spectrum.
+
+**Already first-principles inside this pipeline, no quantum mechanics required:** scattering. Milky quartz and opal fire are Mie theory applied to the *simulated* inclusion and sphere populations — sizes and Δn come from the fabric, σ_s and the phase function follow analytically. This replaces the DB `scatter` field wherever the fabric resolves the scatterers, is independent of the quantum ladder, and folds directly into M13's renderer.
+
+**The gradient across the rest of the DB:** density and elastic constants are routine (~1%); cleavage planes fall out of ab initio surface energies; habit polytopes come from Wulff/attachment-energy constructions (pharmaceutical crystallization predicts shapes this way as a matter of course); hardness is derivable-ish via elastic-modulus correlations. Then the wall: **weathering rate constants**. DFT plus transition-state theory yields mechanisms and activation energies, but field dissolution rates span orders of magnitude with pH, defect density, and biology — kinetics stays empirical, sourced from standard lab compilations (e.g., the USGS Palandri–Kharaka rate parameters). Optics goes all the way down; mechanics most of the way; kinetics stays measured.
+
+**Pragmatic plan.** Every DB optical entry carries a **provenance tag** — measured | computed | hybrid — so both value systems coexist and disagree visibly. Default remains measured data. The computed path: pull Materials Project DFPT dielectric tensors as priors for all ~60 minerals, scissor-correct gaps against a few well-measured anchors, and run a pilot GW+BSE campaign on the visually critical set (quartz, calcite, corundum, diamond) — a bounded HPC project, not a moonshot. The payoff is an inversion of the data flow: splib07 moves from *input* to *validation*, and the stack reads Schrödinger → ε(ω) → fabric → light. Ship-the-cause bottoms out at the Hamiltonian; the mineral DB was never data, just cache.
+
+## References / reading
+
+Dorsey, Edelman, Jensen, Legakis, Pedersen, *Modeling and Rendering of Weathered Stone*, SIGGRAPH 1999 — volumetric slab weathering: moisture flow, mineral transport/dissolution/recrystallization, SSS rendering. Kokaly et al., *USGS Spectral Library Version 7* (splib07a/b, USGS Data Series 1035) — measured mineral/rock reflectance 0.2–200 μm incl. grain-size series; download via USGS ScienceBase. Soulié et al., *Modeling and Rendering of Heterogeneous Granular Materials: Granite Application*, CGF 2007. Avrami/JMAK kinetics + Potts microstructure evolution: any materials-science microstructure text. CIPW norm: standard petrology references (Cross, Iddings, Pirsson, Washington 1902 lineage; modern restatements widely available). Marsh, *Crystal Size Distribution (CSD) in rocks and the kinetics and dynamics of crystallization* — the CSD validation target. Materials Project (materialsproject.org) — computed DFPT dielectric tensors and elastic constants as DB priors. Palandri & Kharaka, *A compilation of rate parameters of water–mineral interaction kinetics* (USGS) — the empirical weathering-kinetics source. GW/BSE optical spectra and point-defect color-center methodology: standard electronic-structure literature; the NV-center corpus for diamond defects, embedded-cluster multireference work for Cr³⁺ in corundum vs beryl.
