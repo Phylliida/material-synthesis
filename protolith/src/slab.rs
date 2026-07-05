@@ -56,7 +56,6 @@ impl SlabDims {
 
     /// Slab voxel count as exec, with the 2^30 bound proved.
     #[verifier::tactus_auto]
-    #[verifier::tactus_tactic("tactus_first | tactus_auto | (intros; try zify at *; try push_cast at *; omega) | (rcases arch_word_bits_valid with h | h <;> simp only [usize_hi, isize_hi, h] at * <;> (intros; try zify at *; try push_cast at *; omega))")]
     pub fn total(&self) -> (t: usize)
         requires self.wf(),
         ensures
@@ -76,12 +75,28 @@ impl SlabDims {
             casesm* _ ∧ _
             refine ⟨?_, ?_⟩ <;> nlinarith
         };
+        // usize overflow for the two products needs the word-width case-split
+        // (tactus_auto can't case-split usize_hi); the ℤ bounds above supply
+        // the magnitudes after zify / push_cast.
+        assert(self.nx * self.ny <= usize::MAX
+            && (self.nx * self.ny) * self.nz <= usize::MAX) by {
+            intros
+            rcases arch_word_bits_valid with h | h <;>
+                simp only [usize_hi, isize_hi, h] at * <;>
+                (try zify at *; try push_cast at *; omega)
+        };
+        // ℕ→ℤ bridge for the `t == spec_total` postcondition.
+        assert(((self.nx * self.ny) * self.nz) as int
+            == (self.nx as int) * (self.ny as int) * (self.nz as int)) by {
+            intros
+            push_cast
+            omega
+        };
         (self.nx * self.ny) * self.nz
     }
 
     /// Linear index of an in-range coordinate triple.
     #[verifier::tactus_auto]
-    #[verifier::tactus_tactic("tactus_first | tactus_auto | (intros; try zify at *; try push_cast at *; omega) | (rcases arch_word_bits_valid with h | h <;> simp only [usize_hi, isize_hi, h] at * <;> (intros; try zify at *; try push_cast at *; omega))")]
     pub fn index(&self, x: usize, y: usize, z: usize) -> (i: usize)
         requires
             self.wf(),
@@ -133,6 +148,26 @@ impl SlabDims {
             intros
             casesm* _ ∧ _
             nlinarith
+        };
+        // usize overflow for every sub-expression of the index, via the
+        // word-width case-split; the ℤ bounds above supply the magnitudes.
+        assert(self.nx * self.ny <= usize::MAX
+            && y * self.nx <= usize::MAX
+            && x + y * self.nx <= usize::MAX
+            && z * (self.nx * self.ny) <= usize::MAX
+            && x + y * self.nx + z * (self.nx * self.ny) <= usize::MAX) by {
+            intros
+            rcases arch_word_bits_valid with h | h <;>
+                simp only [usize_hi, isize_hi, h] at * <;>
+                (try zify at *; try push_cast at *; omega)
+        };
+        // ℕ→ℤ bridge for the `i == spec_index` postcondition.
+        assert((x + y * self.nx + z * (self.nx * self.ny)) as int
+            == (x as int) + (y as int) * (self.nx as int)
+                + (z as int) * ((self.nx as int) * (self.ny as int))) by {
+            intros
+            push_cast
+            omega
         };
         x + y * self.nx + z * (self.nx * self.ny)
     }

@@ -24,8 +24,15 @@ import Mathlib.Tactic.Linarith
 
 /// Wrapping u64 multiply via u128, no bitwise ops.
 #[verifier::tactus_auto]
-#[verifier::tactus_tactic("tactus_first | tactus_auto | (intros; casesm* _ ∧ _; refine ⟨?_, ?_⟩ <;> nlinarith) | (intros; casesm* _ ∧ _; nlinarith)")]
 pub fn wmul(a: u64, b: u64) -> u64 {
+    // The u128 product of two u64s is < 2^128, so it doesn't overflow; the
+    // mod-2^64 result then fits u64. (u128 is fixed-width — no arch split.)
+    assert(0 <= (a as u128) * (b as u128)
+        && (a as u128) * (b as u128) <= u128::MAX) by {
+        intros
+        casesm* _ ∧ _
+        refine ⟨?_, ?_⟩ <;> nlinarith
+    };
     (((a as u128) * (b as u128)) % 0x1_0000_0000_0000_0000u128) as u64
 }
 
@@ -52,7 +59,6 @@ pub fn hash3(seed: u64, counter: u64, tag: u64) -> u64 {
 
 /// Range reduction: the one fact consumers need.
 #[verifier::tactus_auto]
-#[verifier::tactus_tactic("tactus_first | tactus_auto | (intros; omega) | (rcases arch_word_bits_valid with h | h <;> simp only [usize_hi, isize_hi, h] at * <;> (intros; omega))")]
 pub fn hash_below(h: u64, n: usize) -> (r: usize)
     requires 1 <= n,
     ensures r < n,
@@ -63,6 +69,15 @@ pub fn hash_below(h: u64, n: usize) -> (r: usize)
     assert(m < n as u64) by {
         intros
         exact Int.emod_lt_of_pos _ (Int.natCast_pos.mpr (by omega))
+    };
+    // m < n <= usize::MAX, so `m as usize` is lossless and stays < n; the
+    // usize bound needs the word-width case-split (tactus_auto can't do it).
+    // `Int.ofNat_eq_natCast` unifies the `↑n` / `Int.ofNat n` renderings so
+    // omega can connect the goal with the `m < n as u64` hypothesis.
+    assert((m as usize) < n) by {
+        intros
+        rcases arch_word_bits_valid with hw | hw <;>
+            simp only [usize_hi, isize_hi, hw, Int.ofNat_eq_natCast] at * <;> omega
     };
     m as usize
 }
