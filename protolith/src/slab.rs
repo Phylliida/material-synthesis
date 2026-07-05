@@ -162,8 +162,7 @@ pub fn wrap_delta(a: usize, b: usize, n: usize) -> (d: usize)
     let d = if raw <= n - raw { raw } else { n - raw };
     assert(d == spec_wrap_delta(a as int, b as int, n as int)) by {
         intros
-        simp only [slab.spec_wrap_delta]
-        split_ifs <;> omega
+        simp_all (config := { zetaDelta := true }) [slab.spec_wrap_delta] <;> omega
     };
     d
 }
@@ -189,8 +188,7 @@ pub fn abs_delta(a: usize, b: usize, n: usize) -> (d: usize)
     let d = if a >= b { a - b } else { b - a };
     assert(d == spec_abs_delta(a as int, b as int)) by {
         intros
-        simp only [slab.spec_abs_delta]
-        split_ifs <;> omega
+        simp_all (config := { zetaDelta := true }) [slab.spec_abs_delta] <;> omega
     };
     d
 }
@@ -208,8 +206,51 @@ pub open spec fn spec_torus_dist2(
     dx * dx + dy * dy + dz * dz
 }
 
+// Sum of three squared deltas as u32. The deltas are small (dx, dy <= 512 —
+// half the maximum torus width — and dz <= 1023), so the sum of squares is
+// < 2^21 and the u32 cast is lossless. Kept as its own fn so the squaring /
+// overflow / cast `assert`s stay scoped here; `torus_dist2`'s postconditions
+// then follow directly from this `ensures`, without wading through those
+// hypotheses (a flattened body would pile them onto every later obligation).
 #[verifier::tactus_auto]
-#[verifier::tactus_tactic("tactus_first | tactus_auto | (intros; try zify at *; try push_cast at *; omega) | (rcases arch_word_bits_valid with h | h <;> simp only [usize_hi, isize_hi, h] at * <;> (intros; try zify at *; try push_cast at *; omega))")]
+fn sum_sq3(dx: usize, dy: usize, dz: usize) -> (r: u32)
+    requires dx <= 512, dy <= 512, dz <= 1023,
+    ensures
+        r as int == (dx as int) * (dx as int) + (dy as int) * (dy as int)
+            + (dz as int) * (dz as int),
+        r < 0x20_0000,
+{
+    // Each squared delta fits (nonlinear); `omega` then bounds the sum < 2^21,
+    // so the usize products, the sum, and the u32 cast below are all in range.
+    assert(dx * dx <= 0x4_0000) by { intros; nlinarith };
+    assert(dy * dy <= 0x4_0000) by { intros; nlinarith };
+    assert(dz * dz <= 0x10_0000) by { intros; nlinarith };
+    assert(dx * dx + dy * dy + dz * dz < 0x20_0000) by {
+        intros
+        omega
+    };
+    // The usize overflow checks compare against `usize::MAX`, which the Lean
+    // backend renders via the symbolic word-width `usize_hi` (>= 2^32 on any
+    // supported width). `tactus_auto` can't case-split the word size, so
+    // discharge those bounds here (products/sum are far below 2^32 above).
+    assert(dx * dx <= usize::MAX && dy * dy <= usize::MAX && dz * dz <= usize::MAX
+        && dx * dx + dy * dy + dz * dz <= usize::MAX) by {
+        intros
+        rcases arch_word_bits_valid with h | h <;>
+            simp only [usize_hi, isize_hi, h] at * <;> omega
+    };
+    // ℕ→ℤ bridge: the exec sum, cast to int, equals the ℤ sum-of-squares.
+    assert((dx * dx + dy * dy + dz * dz) as int
+        == (dx as int) * (dx as int) + (dy as int) * (dy as int)
+            + (dz as int) * (dz as int)) by {
+        intros
+        push_cast
+        omega
+    };
+    (dx * dx + dy * dy + dz * dz) as u32
+}
+
+#[verifier::tactus_auto]
 pub fn torus_dist2(
     dims: &SlabDims,
     x1: usize, y1: usize, z1: usize,
@@ -232,42 +273,17 @@ pub fn torus_dist2(
         intros
         omega
     };
-    assert(0 <= (dx as int) * (dx as int)) by {
-        intros
-        nlinarith
-    };
-    assert(0 <= (dy as int) * (dy as int)) by {
-        intros
-        nlinarith
-    };
-    assert(0 <= (dz as int) * (dz as int)) by {
-        intros
-        nlinarith
-    };
-    assert((dx as int) * (dx as int) + (dy as int) * (dy as int)
-        + (dz as int) * (dz as int) < 0x20_0000) by {
-        intros
-        casesm* _ ∧ _
-        nlinarith
-    };
-    // The connection to the spec is definitional: the callees' ensures
-    // substitute dx/dy/dz as exactly the spec applications the distance
-    // spec is built from, so one unfold closes it.
-    assert((dx as int) * (dx as int) + (dy as int) * (dy as int)
-        + (dz as int) * (dz as int) == spec_torus_dist2(*dims,
+    let r = sum_sq3(dx, dy, dz);
+    // `r as int == dx² + dy² + dz²` (sum_sq3), and each delta equals its spec
+    // value (`dx == spec_wrap_delta …` etc. from wrap_delta / abs_delta), so
+    // `simp_all` rewrites the sum-of-squares into the distance spec.
+    assert(r as int == spec_torus_dist2(*dims,
         x1 as int, y1 as int, z1 as int,
         x2 as int, y2 as int, z2 as int)) by {
         intros
-        simp only [slab.spec_torus_dist2]
-        rfl
+        simp_all (config := { zetaDelta := true }) [slab.spec_torus_dist2]
     };
-    // KNOWN BLOCKED (4 goals, 2026-07-02): the two postconditions and this
-    // expression's cast goals hit a Lean-backend ensures-substitution type
-    // mismatch — dx's ℤ-typed spec value is substituted into ℕ-typed exec
-    // arithmetic ("tmp__5 + dz * dz has type ℤ but is expected to have
-    // type ℕ"). Reported to the tactus owner; everything above this line
-    // verifies.
-    (dx * dx + dy * dy + dz * dz) as u32
+    r
 }
 
 } // verus!
